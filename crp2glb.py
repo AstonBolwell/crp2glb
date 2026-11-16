@@ -8,6 +8,12 @@ Reads every .crp in ./input/, writes to ./output/<crp_stem>/:
     - *.glb               (meshes with embedded materials + textures)
     - textures/*.dds      (all extracted DDS textures)
     - meta.json           (summary of everything found/linked)
+
+Transparency:
+    Cities: Skylines stores cut-out transparency in the red channel of the
+    _ACIMap texture (binary: values above ACI_CLIP_THRESHOLD are clipped).
+    That mask is baked into the alpha channel of the embedded _MainTex.
+    If a material has no _ACIMap, the texture is left fully opaque.
 """
 
 import os
@@ -36,10 +42,13 @@ MIRROR_AXIS  = "x"
 FLIP_WINDING = True
 TYPE_SUFFIX  = b"PublicKeyToken=null"
 
-# Cities: Skylines uses (0,0,0) to mean "cut out" and (8,8,8) to mean
-# "intentionally black but visible". Treat anything with all channels
-# below this threshold as fully transparent.
-BLACK_CUTOFF = 1
+# _ACIMap transparency: the red channel is a binary clip mask.
+# Pixels whose red value is ABOVE the threshold are clipped (transparent);
+# everything else stays opaque.
+ACI_ALPHA_CHANNEL  = 0     # 0 = R, 1 = G, 2 = B
+ACI_CLIP_THRESHOLD = 128
+ACI_CLIP_ABOVE     = True  # True: value > threshold -> transparent
+                           # False: flip it (value <= threshold -> transparent)
 
 # ----------------------------- helpers -----------------------------
 def u8(f):  return struct.unpack("<B", f.read(1))[0]
@@ -282,26 +291,34 @@ def dds_to_png(dds_path):
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def maintex_with_black_cutout(maintex_path, cutoff=8):
-    """Return PNG bytes where pure-black pixels in _MainTex become fully
-    transparent. Cities: Skylines uses (0,0,0) for cut-outs and (8,8,8) for
-    intentionally-black details, so the threshold must be strictly below 8."""
+def maintex_with_aci_alpha(maintex_path, aci_path):
+    """Return (png_bytes, has_transparency).
+
+    The _ACIMap red channel is a binary clip mask. Pixels where the red value
+    is above ACI_CLIP_THRESHOLD are clipped (alpha 0), everything else is
+    opaque (alpha 255). The mask is baked into the alpha channel of _MainTex.
+    The other ACI channels (colour mask, illumination) are ignored.
+    """
     img = PILImage.open(maintex_path).convert("RGBA")
+    aci = PILImage.open(aci_path).convert("RGBA")
+
+    mask_src = aci.split()[ACI_ALPHA_CHANNEL]
+    if mask_src.size != img.size:
+        # binary mask: nearest-neighbour keeps edges crisp
+        mask_src = mask_src.resize(img.size, PILImage.NEAREST)
+
+    if ACI_CLIP_ABOVE:
+        alpha = mask_src.point(lambda v: 0 if v > ACI_CLIP_THRESHOLD else 255)
+    else:
+        alpha = mask_src.point(lambda v: 0 if v <= ACI_CLIP_THRESHOLD else 255)
+
+    has_transparency = alpha.getextrema()[0] == 0
+
     r, g, b, _ = img.split()
-
-    # alpha = 0 if r<threshold AND g<threshold AND b<threshold, else 255
-    # We use a minimum-of-channels image, then threshold it.
-    from PIL import ImageChops
-    mn = ImageChops.darker(ImageChops.darker(r, g), b)
-    # mn has the minimum of the three channels per pixel.
-    # Pixels with mn < cutoff are near-black -> transparent (0)
-    # Pixels with mn >= cutoff are visible            -> opaque  (255)
-    alpha = mn.point(lambda v: 0 if v < cutoff else 255)
-
     rgba = PILImage.merge("RGBA", (r, g, b, alpha))
     buf = io.BytesIO()
     rgba.save(buf, format="PNG")
-    return buf.getvalue()
+    return buf.getvalue(), has_transparency
 
 # ----------------------------- GLB builder -----------------------------
 def build_glb(mesh, gltf_mat_source, work_dir, assets, out_path,
@@ -361,6 +378,8 @@ def build_glb(mesh, gltf_mat_source, work_dir, assets, out_path,
     textures = []
     tex_indices = {}
     tex_records = []
+    has_transparency = False
+
     if gltf_mat_source:
         tex_paths = {}
         tex_assets = {}
@@ -373,34 +392,46 @@ def build_glb(mesh, gltf_mat_source, work_dir, assets, out_path,
             tex_paths[pname] = p
             tex_assets[pname] = a
 
-        for pname, dds_path in tex_paths.items():
+        # Only _MainTex is embedded. _ACIMap is consumed here to produce the
+        # alpha channel; _XYSMap and the remaining ACI channels are not needed.
+        main_path = tex_paths.get("_MainTex")
+        aci_path  = tex_paths.get("_ACIMap")
+
+        if main_path:
+            alpha_from_aci = False
             try:
-                if pname == "_MainTex":
-                    png = maintex_with_black_cutout(dds_path, BLACK_CUTOFF)
+                if aci_path:
+                    png, has_transparency = maintex_with_aci_alpha(main_path, aci_path)
+                    alpha_from_aci = True
                 else:
-                    png = dds_to_png(dds_path)
+                    png = dds_to_png(main_path)
             except Exception as e:
-                print(f"      image conversion failed for {pname}: {e}")
+                print(f"      _MainTex/_ACIMap conversion failed: {e}")
                 try:
-                    png = dds_to_png(dds_path)
+                    png = dds_to_png(main_path)
+                    has_transparency = False
                 except Exception as e2:
                     print(f"      fallback also failed: {e2}")
-                    continue
+                    png = None
 
-            img = Image(name=pname, mimeType="image/png", bufferView=len(buffer_views))
-            bv = BufferView(byteOffset=len(buffer_data), byteLength=len(png), buffer=0)
-            buffer_views.append(bv)
-            buffer_data += png
-            while len(buffer_data) % 4:
-                buffer_data += b"\x00"
-            images.append(img)
-            tex_indices[pname] = len(images) - 1
-            textures.append(Texture(source=len(images)-1, sampler=0))
-            tex_records.append({
-                "slot": pname,
-                "dds_asset_index": tex_assets[pname]["index"],
-                "dds_written_name": tex_assets[pname]["written_name"],
-            })
+            if png is not None:
+                img = Image(name="_MainTex", mimeType="image/png", bufferView=len(buffer_views))
+                bv = BufferView(byteOffset=len(buffer_data), byteLength=len(png), buffer=0)
+                buffer_views.append(bv)
+                buffer_data += png
+                while len(buffer_data) % 4:
+                    buffer_data += b"\x00"
+                images.append(img)
+                tex_indices["_MainTex"] = len(images) - 1
+                textures.append(Texture(source=len(images)-1, sampler=0))
+                tex_records.append({
+                    "slot": "_MainTex",
+                    "dds_asset_index": tex_assets["_MainTex"]["index"],
+                    "dds_written_name": tex_assets["_MainTex"]["written_name"],
+                    "alpha_from_aci": alpha_from_aci,
+                    "aci_dds_written_name": tex_assets["_ACIMap"]["written_name"] if alpha_from_aci else None,
+                    "has_transparent_pixels": has_transparency,
+                })
 
     gltf_mat = None
     if "_MainTex" in tex_indices:
@@ -411,9 +442,12 @@ def build_glb(mesh, gltf_mat_source, work_dir, assets, out_path,
                 metallicFactor=0.0, roughnessFactor=1.0,
             ),
             doubleSided=True,
-            alphaMode="MASK",
-            alphaCutoff=0.5,
         )
+        if has_transparency:
+            gltf_mat.alphaMode = "MASK"
+            gltf_mat.alphaCutoff = 0.5
+        else:
+            gltf_mat.alphaMode = "OPAQUE"
 
     prim_attrs = Attributes(POSITION=acc_pos)
     if acc_uv is not None:  prim_attrs.TEXCOORD_0 = acc_uv
