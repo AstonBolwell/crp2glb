@@ -39,7 +39,7 @@ TYPE_SUFFIX  = b"PublicKeyToken=null"
 # Cities: Skylines uses (0,0,0) to mean "cut out" and (8,8,8) to mean
 # "intentionally black but visible". Treat anything with all channels
 # below this threshold as fully transparent.
-BLACK_CUTOFF = 8
+BLACK_CUTOFF = 1
 
 # ----------------------------- helpers -----------------------------
 def u8(f):  return struct.unpack("<B", f.read(1))[0]
